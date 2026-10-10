@@ -1,0 +1,502 @@
+-- ============================================================
+-- Project: Credit Portfolio Risk Analysis Using SQL
+-- Author:  Hannah (Huong) Tran
+-- Analysis E: Risk vs Pricing (Interest Rate vs Default)
+-- Dataset: Lending Club accepted loans, 2007-2018
+-- Table:   accepted_2007_to_2018Q4
+--
+-- Description: A lender is paid an interest rate to take credit
+--              risk. This script asks whether that payment was
+--              enough, using what actually happened to each loan:
+--                1. Does the price (interest rate) rise in step
+--                   with risk across the 35 sub-grades?
+--                2. What return did each grade actually deliver,
+--                   versus the rate it promised?
+--                3. How much of the interest income was eaten by
+--                   credit losses?
+--                4. Is each grade profitable after funding and
+--                   servicing costs, and how much could losses rise
+--                   before it breaks even?
+--                5. Is the margin enough to cover a BAD year, not
+--                   just an average one? (risk-adjusted return)
+--                6. Inside a grade, is the rate still sensitive to
+--                   risk, or is there mispricing / adverse selection?
+--                7. Did pricing keep up with risk through the cycle?
+--                8. How much default does the price "imply", versus
+--                   how much actually happened? (risk premium)
+--
+-- References (from my CQF / CFA study materials):
+--   - CQF M2L3 Additional Notes (Coleman, "A Practical Guide to
+--     Risk Management", CFA Institute Research Foundation, 2011):
+--       * 1,000-loan example: promised income 6.5% vs expected
+--         income after defaults; provisions cover EXPECTED loss,
+--         reserves and economic capital cover a bad year (tail);
+--         income should be measured net of the cost of funds.
+--         -> Queries 2-5 replicate this logic on real loans.
+--       * Actuarial pricing (physical / historical probabilities):
+--         "a loan is taken on the balance sheet if the spread
+--         earned on the loan is deemed ... a sufficient
+--         compensation for the risk" (citing McNeil, Frey and
+--         Embrechts). This whole script is actuarial pricing.
+--       * Physical vs risk-neutral probability measures.
+--         -> Query 8 compares price-implied and realised default.
+--   - CQF M5S8 "Credit Triangle": spread ~ lambda x (1 - RR).
+--     -> Queries 4 and 8 use it forwards (break-even spread) and
+--        backwards (default implied by the price).
+--   - CQF Lecture 5.7: constant default intensity lambda; with
+--     survival P = exp(-lambda T). The simplest estimator of a
+--     constant intensity is defaults / total time at risk.
+--     -> Query 8 estimates lambda that way.
+--
+-- KEY METHOD POINTS
+--   - COMPLETE loans only: loans old enough to have reached their
+--     full term (36 or 60 months) AND with a final outcome (fully
+--     paid or charged off). Comparing a rate with losses on loans
+--     that have not finished would understate losses (censoring).
+--   - Returns are ANNUALISED on average outstanding principal
+--     ("principal-years"), so they are in the same units as the
+--     interest rate (% per year). Average balance assumes roughly
+--     straight-line repayment, an approximation.
+--   - Funding cost and servicing fee are ILLUSTRATIVE ASSUMPTIONS
+--     stored in table pricing_params (Query 0). Change them there
+--     and every query updates.
+--
+-- HOW TO RUN: run QUERY 0 once (builds helper tables), click
+--   Write Changes, then highlight one query at a time and press F5.
+-- ============================================================
+
+
+-- ============================================================
+-- QUERY 0 (SETUP): helper table + assumption table
+-- ============================================================
+-- Context: Converts text to numbers, parses text dates into month
+-- indexes, and calculates for every loan:
+--   exit_mob         months on book until default, payoff or cut-off
+--   principal_years  average outstanding balance x years on book
+--                    = exposure-time used to annualise returns
+--   cash_in          everything the lender received: principal,
+--                    interest, late fees, net recoveries
+--   ead              exposure at default = funded - principal repaid
+--   net_credit_loss  ead - net recoveries (defaulted loans only)
+--   is_complete      full term elapsed AND final outcome known
+
+DROP TABLE IF EXISTS pricing_base;
+
+CREATE TABLE pricing_base AS
+WITH parsed AS (
+    SELECT
+        id,
+        grade,
+        sub_grade,
+        purpose,
+        CASE WHEN TRIM(term) LIKE '60%' THEN 60 ELSE 36 END                 AS term_months,
+        CAST(NULLIF(int_rate, '')                AS REAL)                   AS int_rate,
+        CAST(NULLIF(funded_amnt, '')             AS REAL)                   AS funded_amnt,
+        CAST(NULLIF(fico_range_low, '')          AS REAL)                   AS fico,
+        CAST(NULLIF(dti, '')                     AS REAL)                   AS dti,
+        COALESCE(CAST(NULLIF(total_rec_prncp, '')         AS REAL), 0)      AS total_rec_prncp,
+        COALESCE(CAST(NULLIF(total_rec_int, '')           AS REAL), 0)      AS total_rec_int,
+        COALESCE(CAST(NULLIF(total_rec_late_fee, '')      AS REAL), 0)      AS late_fees,
+        COALESCE(CAST(NULLIF(recoveries, '')              AS REAL), 0)      AS recoveries,
+        COALESCE(CAST(NULLIF(collection_recovery_fee, '') AS REAL), 0)      AS recovery_fee,
+        CASE WHEN loan_status LIKE '%Charged Off%' OR loan_status = 'Default'
+             THEN 1 ELSE 0 END                                              AS is_default,
+        CASE WHEN loan_status LIKE '%Fully Paid%' THEN 1 ELSE 0 END         AS is_paid,
+        CAST(SUBSTR(issue_d, -4) AS INTEGER)                                AS vintage,
+        CAST(SUBSTR(issue_d, -4) AS INTEGER) * 12 +
+            CASE SUBSTR(issue_d, 1, 3)
+                WHEN 'Jan' THEN 1  WHEN 'Feb' THEN 2  WHEN 'Mar' THEN 3
+                WHEN 'Apr' THEN 4  WHEN 'May' THEN 5  WHEN 'Jun' THEN 6
+                WHEN 'Jul' THEN 7  WHEN 'Aug' THEN 8  WHEN 'Sep' THEN 9
+                WHEN 'Oct' THEN 10 WHEN 'Nov' THEN 11 WHEN 'Dec' THEN 12
+            END                                                             AS issue_idx,
+        CASE WHEN NULLIF(last_pymnt_d, '') IS NULL THEN NULL
+             ELSE CAST(SUBSTR(last_pymnt_d, -4) AS INTEGER) * 12 +
+                CASE SUBSTR(last_pymnt_d, 1, 3)
+                    WHEN 'Jan' THEN 1  WHEN 'Feb' THEN 2  WHEN 'Mar' THEN 3
+                    WHEN 'Apr' THEN 4  WHEN 'May' THEN 5  WHEN 'Jun' THEN 6
+                    WHEN 'Jul' THEN 7  WHEN 'Aug' THEN 8  WHEN 'Sep' THEN 9
+                    WHEN 'Oct' THEN 10 WHEN 'Nov' THEN 11 WHEN 'Dec' THEN 12
+                END
+        END                                                                 AS last_pay_idx
+    FROM accepted_2007_to_2018Q4
+    WHERE NULLIF(issue_d, '') IS NOT NULL
+),
+cutoff AS (
+    SELECT MAX(issue_idx) AS cutoff_idx FROM parsed
+),
+timed AS (
+    SELECT
+        p.*,
+        c.cutoff_idx - p.issue_idx AS loan_age,
+        CASE WHEN p.is_default = 1 OR p.is_paid = 1
+             THEN MAX(COALESCE(p.last_pay_idx, p.issue_idx) - p.issue_idx, 1)
+             ELSE MAX(c.cutoff_idx - p.issue_idx, 1)
+        END                        AS exit_mob
+    FROM parsed p, cutoff c
+)
+SELECT
+    t.*,
+    CASE WHEN t.loan_age >= t.term_months AND (t.is_default = 1 OR t.is_paid = 1)
+         THEN 1 ELSE 0 END                                                  AS is_complete,
+    t.exit_mob / 12.0 * (t.funded_amnt + (t.funded_amnt - t.total_rec_prncp)) / 2.0
+                                                                            AS principal_years,
+    t.total_rec_prncp + t.total_rec_int + t.late_fees
+        + t.recoveries - t.recovery_fee                                     AS cash_in,
+    CASE WHEN t.is_default = 1 THEN t.funded_amnt - t.total_rec_prncp ELSE 0 END
+                                                                            AS ead,
+    CASE WHEN t.is_default = 1
+         THEN t.funded_amnt - t.total_rec_prncp - (t.recoveries - t.recovery_fee)
+         ELSE 0 END                                                         AS net_credit_loss
+FROM timed t;
+
+-- Assumptions used in Queries 4, 5, 7 and 8 (edit and re-run).
+--   funding_cost_pct : what the lender pays for its money, % p.a.
+--   servicing_pct    : cost of servicing the loans, % of balance p.a.
+-- Both are ILLUSTRATIVE, not estimated from the data.
+DROP TABLE IF EXISTS pricing_params;
+CREATE TABLE pricing_params (funding_cost_pct REAL, servicing_pct REAL);
+INSERT INTO pricing_params VALUES (3.0, 1.0);
+
+-- Quick check: how many complete loans per term?
+SELECT term_months, COUNT(*) AS loans, SUM(is_complete) AS complete_loans
+FROM pricing_base
+GROUP BY term_months;
+
+
+-- ============================================================
+-- QUERY 1: Does the price rise in step with risk?
+--          (pricing curve across sub-grades)
+-- ============================================================
+-- Context: A sound pricing grid charges more for every step up in
+-- risk. For 36-month complete loans, each sub-grade (A1 ... G5)
+-- is compared with the one before it:
+--   rate_step         extra interest charged vs previous sub-grade
+--   default_step_pp   extra lifetime default vs previous sub-grade
+--   flag              'Inversion' when a riskier-priced sub-grade
+--                     actually defaulted LESS than the one before;
+--                     'Steep' when default jumps far more than the
+--                     price (more than 3x the rate step)
+-- LAG() is a window function that reads the previous row.
+-- Sub-grades with fewer than 300 loans are dropped as too noisy.
+
+WITH s AS (
+    SELECT
+        sub_grade,
+        COUNT(*)            AS loans,
+        AVG(int_rate)       AS rate,
+        AVG(is_default)     AS pd
+    FROM pricing_base
+    WHERE is_complete = 1
+      AND term_months = 36
+    GROUP BY sub_grade
+    HAVING COUNT(*) >= 300
+)
+SELECT
+    sub_grade,
+    loans,
+    ROUND(rate, 2)                                                      AS avg_interest_rate,
+    ROUND(100.0 * pd, 2)                                                AS lifetime_default_pct,
+    ROUND(rate - LAG(rate) OVER (ORDER BY sub_grade), 2)                AS rate_step,
+    ROUND(100.0 * (pd - LAG(pd) OVER (ORDER BY sub_grade)), 2)          AS default_step_pp,
+    CASE
+        WHEN pd < LAG(pd) OVER (ORDER BY sub_grade)
+            THEN 'Inversion'
+        WHEN 100.0 * (pd - LAG(pd) OVER (ORDER BY sub_grade))
+             > 3 * (rate - LAG(rate) OVER (ORDER BY sub_grade))
+            THEN 'Steep'
+        ELSE ''
+    END                                                                 AS flag
+FROM s
+ORDER BY sub_grade;
+
+
+-- ============================================================
+-- QUERY 2: Promised rate vs realised return
+-- ============================================================
+-- Context: The interest rate is what the borrower PROMISED to pay.
+-- The realised return is what the lender actually EARNED after
+-- defaults, per year of money outstanding:
+--   realised_return = (cash received - amount lent)
+--                     / principal-years
+-- Both are in % per year, so they can be compared directly.
+--   promised_rate       balance-weighted average interest rate
+--   yield_erosion_pp    promised - realised: how much of the
+--                       promise was lost to credit events
+--   pct_loans_lost_money share of loans that returned less cash
+--                       than was lent
+-- This is Coleman's "promised income vs expected income" on real
+-- loans. Split by term because 60-month loans behave differently.
+
+SELECT
+    term_months,
+    grade,
+    COUNT(*)                                                            AS complete_loans,
+    ROUND(SUM(int_rate * principal_years) / SUM(principal_years), 2)    AS promised_rate,
+    ROUND(100.0 * AVG(is_default), 2)                                   AS lifetime_default_pct,
+    ROUND(100.0 * (SUM(cash_in) - SUM(funded_amnt)) / SUM(principal_years), 2)
+                                                                        AS realised_return_pct,
+    ROUND(SUM(int_rate * principal_years) / SUM(principal_years)
+          - 100.0 * (SUM(cash_in) - SUM(funded_amnt)) / SUM(principal_years), 2)
+                                                                        AS yield_erosion_pp,
+    ROUND(100.0 * AVG(cash_in < funded_amnt), 2)                        AS pct_loans_lost_money
+FROM pricing_base
+WHERE is_complete = 1
+GROUP BY term_months, grade
+HAVING COUNT(*) >= 500
+ORDER BY term_months, grade;
+
+
+-- ============================================================
+-- QUERY 3: Where did the return go? (return decomposition)
+-- ============================================================
+-- Context: Breaks each grade's annualised return into its parts,
+-- all as % of principal-years (% per year):
+--   + interest income
+--   + late fees
+--   - gross credit loss  (EAD of defaulted loans)
+--   + net recoveries     (recoveries after collection fees)
+--   = net return
+--   loss_share_of_interest = net credit loss / interest income:
+--   "for every 100 of interest earned, X was eaten by losses".
+-- Net return here equals realised_return in Query 2 (same cash,
+-- different presentation), which is a useful reconciliation check.
+
+SELECT
+    grade,
+    COUNT(*)                                                                AS complete_loans,
+    ROUND(100.0 * SUM(total_rec_int)               / SUM(principal_years), 2)  AS interest_income_pct,
+    ROUND(100.0 * SUM(late_fees)                   / SUM(principal_years), 3)  AS late_fees_pct,
+    ROUND(-100.0 * SUM(ead)                        / SUM(principal_years), 2)  AS gross_credit_loss_pct,
+    ROUND(100.0 * SUM(CASE WHEN is_default = 1 THEN recoveries - recovery_fee ELSE 0 END)
+                                                   / SUM(principal_years), 2)  AS net_recoveries_pct,
+    ROUND(100.0 * (SUM(total_rec_int) + SUM(late_fees) - SUM(net_credit_loss))
+                                                   / SUM(principal_years), 2)  AS net_return_pct,
+    ROUND(100.0 * SUM(net_credit_loss) / NULLIF(SUM(total_rec_int), 0), 1)     AS loss_share_of_interest_pct
+FROM pricing_base
+WHERE is_complete = 1
+GROUP BY grade
+ORDER BY grade;
+
+
+-- ============================================================
+-- QUERY 4: Is each grade profitable after costs, and how much
+--          room is there before it breaks even?
+-- ============================================================
+-- Context: Coleman notes that income should be measured net of the
+-- cost of funds. Here, per grade (% per year of balance):
+--   interest_yield     interest + late fees earned
+--   annual_loss_rate   net credit loss per year  ~ lambda x LGD
+--                      (the credit triangle's break-even spread)
+--   net_margin         yield - loss - funding - servicing
+--   loss_cover_multiple = (yield - funding - servicing) / loss
+--                      "losses could rise to X times today's level
+--                       before the grade stops making money"
+--   loss_headroom_pct  the same as a % increase in losses
+-- A thin headroom means the grade is fragile: a modest recession
+-- could wipe out its profit.
+
+WITH g AS (
+    SELECT
+        grade,
+        COUNT(*)                                        AS loans,
+        SUM(principal_years)                            AS py,
+        SUM(total_rec_int + late_fees)                  AS income,
+        SUM(net_credit_loss)                            AS loss
+    FROM pricing_base
+    WHERE is_complete = 1
+    GROUP BY grade
+)
+SELECT
+    g.grade,
+    g.loans                                                             AS complete_loans,
+    ROUND(100.0 * g.income / g.py, 2)                                   AS interest_yield_pct,
+    ROUND(100.0 * g.loss / g.py, 2)                                     AS annual_loss_rate_pct,
+    p.funding_cost_pct,
+    p.servicing_pct,
+    ROUND(100.0 * (g.income - g.loss) / g.py - p.funding_cost_pct - p.servicing_pct, 2)
+                                                                        AS net_margin_pct,
+    ROUND((100.0 * g.income / g.py - p.funding_cost_pct - p.servicing_pct)
+          / NULLIF(100.0 * g.loss / g.py, 0), 2)                        AS loss_cover_multiple,
+    ROUND(100.0 * ((100.0 * g.income / g.py - p.funding_cost_pct - p.servicing_pct)
+          / NULLIF(100.0 * g.loss / g.py, 0) - 1), 0)                   AS loss_headroom_pct
+FROM g
+CROSS JOIN pricing_params p
+ORDER BY g.grade;
+
+
+-- ============================================================
+-- QUERY 5: Does the margin survive a BAD year?
+--          (tail risk and return on stress capital)
+-- ============================================================
+-- Context: Coleman's framework: provisions cover the EXPECTED loss;
+-- reserves and economic capital cover an unusually bad year.
+-- Pricing must therefore pay for the capital held against the
+-- tail, not just the average loss.
+-- Here each grade's loss rate is measured separately for each
+-- vintage (vintages with 500+ complete loans in the grade):
+--   avg_loss_rate      loss rate across all vintages
+--   best / worst       lowest and highest vintage loss rate
+--   stress_buffer_pp   worst - average: the extra loss a bad year
+--                      brings, a simple proxy for unexpected loss
+--   return_on_stress   net margin / stress buffer: a RAROC-style
+--                      ratio. Higher = more return per unit of
+--                      tail risk. Below 1 means one bad vintage
+--                      would wipe out more than a year's margin.
+
+WITH v AS (
+    SELECT
+        grade,
+        vintage,
+        COUNT(*)                                        AS loans,
+        SUM(net_credit_loss) / SUM(principal_years)     AS loss_rate
+    FROM pricing_base
+    WHERE is_complete = 1
+    GROUP BY grade, vintage
+    HAVING COUNT(*) >= 500
+),
+g AS (
+    SELECT
+        grade,
+        SUM(total_rec_int + late_fees) / SUM(principal_years)   AS yield,
+        SUM(net_credit_loss) / SUM(principal_years)             AS loss
+    FROM pricing_base
+    WHERE is_complete = 1
+    GROUP BY grade
+)
+SELECT
+    g.grade,
+    COUNT(v.vintage)                                                    AS vintages_used,
+    ROUND(100.0 * g.loss, 2)                                            AS avg_loss_rate_pct,
+    ROUND(100.0 * MIN(v.loss_rate), 2)                                  AS best_vintage_loss_pct,
+    ROUND(100.0 * MAX(v.loss_rate), 2)                                  AS worst_vintage_loss_pct,
+    ROUND(100.0 * (MAX(v.loss_rate) - g.loss), 2)                       AS stress_buffer_pp,
+    ROUND(100.0 * (g.yield - g.loss) - p.funding_cost_pct - p.servicing_pct, 2)
+                                                                        AS net_margin_pct,
+    ROUND((100.0 * (g.yield - g.loss) - p.funding_cost_pct - p.servicing_pct)
+          / NULLIF(100.0 * (MAX(v.loss_rate) - g.loss), 0), 2)          AS return_on_stress
+FROM g
+JOIN v ON v.grade = g.grade
+CROSS JOIN pricing_params p
+GROUP BY g.grade, g.yield, g.loss, p.funding_cost_pct, p.servicing_pct
+ORDER BY g.grade;
+
+
+-- ============================================================
+-- QUERY 6: Inside a grade, does the price still respond to risk?
+--          (mispricing and adverse selection)
+-- ============================================================
+-- Context: Every loan in a sub-grade gets roughly the same rate.
+-- If borrowers inside the same grade still differ a lot in risk
+-- (here by debt-to-income), the low-DTI borrowers are overcharged
+-- and the high-DTI borrowers are undercharged.
+-- Two consequences an analyst should raise:
+--   - adverse selection: good borrowers leave for cheaper lenders,
+--     the pool left behind gets riskier
+--   - opportunity: risk-based pricing inside the grade, or
+--     investors selecting the better loans
+-- Read across one grade: if default and realised return move a lot
+-- while the rate barely moves, the grade-level price is too blunt.
+-- To test FICO instead, swap the DTI band for a FICO band.
+
+SELECT
+    grade,
+    CASE WHEN dti < 10 THEN '1 DTI <10'
+         WHEN dti < 20 THEN '2 DTI 10-20'
+         WHEN dti < 30 THEN '3 DTI 20-30'
+         ELSE '4 DTI 30+' END                                           AS dti_band,
+    COUNT(*)                                                            AS complete_loans,
+    ROUND(SUM(int_rate * principal_years) / SUM(principal_years), 2)    AS avg_interest_rate,
+    ROUND(100.0 * AVG(is_default), 2)                                   AS lifetime_default_pct,
+    ROUND(100.0 * (SUM(cash_in) - SUM(funded_amnt)) / SUM(principal_years), 2)
+                                                                        AS realised_return_pct
+FROM pricing_base
+WHERE is_complete = 1
+  AND dti IS NOT NULL
+GROUP BY grade, dti_band
+HAVING COUNT(*) >= 300
+ORDER BY grade, dti_band;
+
+
+-- ============================================================
+-- QUERY 7: Did pricing keep up with risk through the cycle?
+-- ============================================================
+-- Context: For 36-month complete loans, by vintage:
+--   promised_rate, annual loss, realised return, yield erosion and
+--   net margin after the assumed funding and servicing costs.
+-- Questions this answers:
+--   - Were loans written just before or during the financial
+--     crisis priced for what followed?
+--   - When the lender cut rates to grow, did losses rise to eat
+--     the margin?
+-- Grade mix also changes by year; compare with Analysis C
+-- Query 6 (mix-adjusted performance) before blaming pricing alone.
+
+SELECT
+    m.vintage,
+    COUNT(*)                                                                AS complete_loans,
+    ROUND(SUM(m.int_rate * m.principal_years) / SUM(m.principal_years), 2)  AS promised_rate,
+    ROUND(100.0 * SUM(m.net_credit_loss) / SUM(m.principal_years), 2)       AS annual_loss_rate_pct,
+    ROUND(100.0 * (SUM(m.cash_in) - SUM(m.funded_amnt)) / SUM(m.principal_years), 2)
+                                                                            AS realised_return_pct,
+    ROUND(SUM(m.int_rate * m.principal_years) / SUM(m.principal_years)
+          - 100.0 * (SUM(m.cash_in) - SUM(m.funded_amnt)) / SUM(m.principal_years), 2)
+                                                                            AS yield_erosion_pp,
+    ROUND(100.0 * (SUM(m.cash_in) - SUM(m.funded_amnt)) / SUM(m.principal_years)
+          - p.funding_cost_pct - p.servicing_pct, 2)                        AS net_margin_pct
+FROM pricing_base m
+CROSS JOIN pricing_params p
+WHERE m.is_complete = 1
+  AND m.term_months = 36
+GROUP BY m.vintage, p.funding_cost_pct, p.servicing_pct
+HAVING COUNT(*) >= 1000
+ORDER BY m.vintage;
+
+
+-- ============================================================
+-- QUERY 8: How much default does the price imply, versus how
+--          much actually happened? (risk premium)
+-- ============================================================
+-- Context: Running the credit triangle BACKWARDS:
+--   spread           = interest rate - funding - servicing
+--   implied_lambda   = spread / LGD
+--                      the annual default rate the lender could
+--                      absorb and still break even
+--   realised_lambda  = defaults / loan-years at risk
+--                      the textbook estimator of a constant default
+--                      intensity (CQF Lecture 5.7)
+--   LGD              = net credit loss / EAD on defaulted loans
+--   premium_multiple = implied / realised
+-- Reading it (cf. Coleman on physical vs risk-neutral measures):
+--   > 1   the price builds in more default than history delivered:
+--         a cushion for bad years, capital and profit
+--   ~ 1   priced only for the average loss: no buffer
+--   < 1   under-priced: losses exceeded what the price could carry
+-- In traded credit markets, implied (risk-neutral) default is
+-- typically higher than historical default for the same reason.
+
+WITH g AS (
+    SELECT
+        grade,
+        COUNT(*)                                                AS loans,
+        SUM(is_default)                                         AS defaults,
+        SUM(exit_mob) / 12.0                                    AS loan_years,
+        SUM(int_rate * principal_years) / SUM(principal_years)  AS rate,
+        SUM(net_credit_loss) / NULLIF(SUM(ead), 0)              AS lgd
+    FROM pricing_base
+    WHERE is_complete = 1
+    GROUP BY grade
+)
+SELECT
+    g.grade,
+    g.loans                                                             AS complete_loans,
+    ROUND(g.rate, 2)                                                    AS avg_interest_rate,
+    ROUND(g.rate - p.funding_cost_pct - p.servicing_pct, 2)             AS spread_pct,
+    ROUND(100.0 * g.lgd, 1)                                             AS lgd_pct,
+    ROUND((g.rate - p.funding_cost_pct - p.servicing_pct) / g.lgd, 2)   AS implied_annual_default_pct,
+    ROUND(100.0 * g.defaults / g.loan_years, 2)                         AS realised_annual_default_pct,
+    ROUND(((g.rate - p.funding_cost_pct - p.servicing_pct) / g.lgd)
+          / NULLIF(100.0 * g.defaults / g.loan_years, 0), 2)            AS premium_multiple
+FROM g
+CROSS JOIN pricing_params p
+ORDER BY g.grade;
